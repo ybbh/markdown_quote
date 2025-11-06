@@ -11,13 +11,13 @@ This tool scans markdown files for special quote blocks in the format:
 
 And replaces them with the actual content from the referenced files.
 """
-
+import sys
+from collections import deque, defaultdict
 import os
 import re
-import glob
 import argparse
-from collections import deque, defaultdict
-
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict, Any
 
 # Regular expression patterns for parsing quote blocks
 CONTENT_PATTERN = r'\s+content="\[([\s\S]*?)\]\((?P<content>[\s\S]*?)\)"'
@@ -27,6 +27,428 @@ BEGIN_PATTERN = rf'<!--\s*quote_begin({VALUES_PATTERN})\s*-->'
 END_PATTERN = r'<!--\s*quote_end\s*-->'
 QUOTE_PATTERN = rf'(?P<begin_block>{BEGIN_PATTERN})([.\s\S]*)(?P<end_block>{END_PATTERN})'
 
+
+class MarkdownQuoteProcessor:
+    """
+    Processor for Markdown files that replaces quote blocks with content
+    from referenced source files. Handles nested quote blocks correctly.
+    """
+
+    def __init__(self):
+        # Patterns for individual tags (not for matching entire blocks)
+        self.begin_pattern = re.compile(BEGIN_PATTERN)
+        self.end_pattern = re.compile(END_PATTERN)
+
+    def find_quote_blocks(self, content: str, file_name:str) -> list[Any]:
+        """
+        Find all quote blocks in content, handling nesting correctly.
+
+        Args:
+            content: Markdown content to parse
+            file_name: Markdown file name
+
+        Returns:
+            List of quote block dictionaries with start, end, and parameters
+        """
+        blocks = []
+        stack = []
+
+        # Find all begin and end tags
+        for begin_match in self.begin_pattern.finditer(content):
+            stack.append({
+                'type': 'begin',
+                'match': begin_match,
+                'params_str': begin_match.group(1),
+                'start_pos': begin_match.start(),
+                'end_pos': begin_match.end()
+            })
+
+        for end_match in self.end_pattern.finditer(content):
+            stack.append({
+                'type': 'end',
+                'match': end_match,
+                'start_pos': end_match.start(),
+                'end_pos': end_match.end()
+            })
+
+        # Sort all tags by position
+        stack.sort(key=lambda x: x['start_pos'])
+
+        # Process stack to find matching begin-end pairs
+        open_blocks = []
+        for item in stack:
+
+            if item['type'] == 'begin':
+                open_blocks.append(item)
+            else:  # end
+                if open_blocks:
+                    begin_item = open_blocks.pop()
+                    blocks.append({
+                        'begin_match': begin_item['match'],
+                        'end_match': item['match'],
+                        'start_pos': begin_item['start_pos'],
+                        'end_pos': item['end_pos'],
+                        'params_str': begin_item['params_str'],
+                        'content_start': begin_item['end_pos'],
+                        'content_end': item['start_pos']
+                    })
+        if len(stack) % 2 == 1 or len(open_blocks) != 0:
+            print("Error parse quote blocks in :", file_name, file=sys.stderr)
+            print("The stack:", file=sys.stderr)
+            for (i, item) in enumerate(stack):
+                print("|--> ", i, ". \n" , indent_text(content[item['start_pos']:item['end_pos']]),  file=sys.stderr)
+            if len(open_blocks) != 0:
+                print("The open blocks in the stack:", file=sys.stderr)
+                for (i, item) in enumerate(open_blocks):
+                    print("|--> ", i, ". \n" , indent_text(content[item['start_pos']:item['end_pos']]), file=sys.stderr)
+            return []
+
+        return blocks
+
+    def pre_process_markdown_content(self, content: str, md_file_path: Path, dependency_map:Dict[str, Any]):
+        """
+        Process markdown content and replace all quote blocks.
+
+        Args:
+            dependency_map: dependency map
+            content: Markdown content to process
+            md_file_path: Markdown file path
+
+        Returns:
+            Processed content with quote blocks replaced
+        """
+        # Find all quote blocks
+        blocks = self.find_quote_blocks(content, md_file_path.name)
+
+        if not blocks:
+            return
+
+        # Process blocks from innermost to outermost to handle nesting
+        # Sort by start position in reverse order so we replace from the end
+        blocks.sort(key=lambda x: x['start_pos'], reverse=True)
+
+        result = content
+        for block in blocks:
+            pre_process_quote_block(block, md_file_path, result, dependency_map)
+
+    def process_markdown_content(self, content: str, file_path: Path) -> str:
+        """
+        Process markdown content and replace all quote blocks.
+
+        Args:
+            content: Markdown content to process
+            file_path: Markdown file paths
+
+        Returns:
+            Processed content with quote blocks replaced
+        """
+
+        base_dir = file_path.parent
+        # Find all quote blocks
+        blocks = self.find_quote_blocks(content, file_path.name)
+
+        if not blocks:
+            return content
+
+        # Process blocks from innermost to outermost to handle nesting
+        # Sort by start position in reverse order so we replace from the end
+        blocks.sort(key=lambda x: x['start_pos'], reverse=True)
+
+        result = content
+        for block in blocks:
+            replacement = process_quote_block(block, base_dir)
+
+            # Replace the entire block (from begin tag to end tag)
+            before = result[:block['start_pos']]
+            after = result[block['end_pos']:]
+            result = before + replacement + after
+
+        return result
+
+    def pre_process_markdown_file(self, file_path: Path, dependency_map:Dict[str, Any]):
+        """
+        Pre-Process a single Markdown file, retrieve dependencies.
+
+        Args:
+            file_path: Path to the Markdown file
+            dependency_map: dependency map
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self.pre_process_markdown_content(content, file_path, dependency_map)
+        except Exception as e:
+            print(f"Error processing {file_path}: {str(e)}")
+
+    def process_markdown_file(self, file_path: Path) -> bool:
+        """
+        Process a single Markdown file, replacing all quote blocks.
+
+        Args:
+            file_path: Path to the Markdown file
+
+        Returns:
+            True if file was modified, False otherwise
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            # Get base directory for relative file paths (same as Markdown file directory)
+
+            # Process content
+            new_content = self.process_markdown_content(content, file_path)
+
+            # Write back only if content changed
+            if new_content != content:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(new_content)
+                return True
+
+            return False
+
+        except Exception as e:
+            print(f"Error processing {file_path}: {str(e)}")
+            return False
+
+    def process_directory(self, directory: Path) -> Tuple[int, int]:
+        """
+        Process all Markdown files in a directory.
+
+        Args:
+            directory: Directory to process
+
+        Returns:
+            Tuple of (files_processed, files_modified)
+        """
+        markdown_files = find_markdown_files(directory)
+
+        processed_count = 0
+        modified_count = 0
+
+        dependencies_map = {}
+        for file_path in markdown_files:
+            self.pre_process_markdown_file(file_path, dependencies_map)
+
+        sorted_files = topological_sort(dependencies_map)
+
+        for file_path in sorted_files:
+            if is_md_file(file_path):
+                modified = self.process_markdown_file(Path(file_path).resolve())
+                if modified:
+                    modified_count += 1
+                    print(f"Updated: {file_path}")
+                processed_count += 1
+
+        return processed_count, modified_count
+
+def indent_text(multiline_text:str) -> str:
+    text = ""
+    indent = "    "
+    for line in multiline_text.split('\n'):
+        text += f"{indent}{line}\n"
+    return text
+
+def parse_content_parameter(content_str: str) -> Tuple[Optional[str], str, Optional[Tuple[int, int]]]:
+    """
+    Parse the content parameter to extract file path and line range.
+
+    Args:
+        content_str: Content parameter string in format [description](file_path#Lstart-Lend)
+
+    Returns:
+        Tuple of (description, file_path, line_range)
+    """
+    # Match the pattern [description](file_path#Lstart-Lend)
+    match = re.match(r'\[(.*?)\]\((.*?)(#L(\d*)-L(\d*))?\)', content_str)
+    if not match:
+        raise ValueError(f"Invalid content format: {content_str}")
+
+    description = match.group(1) if match.group(1) else None
+    file_path = match.group(2)
+
+    # Parse line range if present
+    line_range = None
+    if match.group(3):  # If line range is specified
+        start_str = match.group(4)  # Could be empty
+        end_str = match.group(5)  # Could be empty
+
+        start_line = int(start_str) if start_str else None
+        end_line = int(end_str) if end_str else None
+
+        line_range = (start_line, end_line)
+
+    return description, file_path, line_range
+
+
+def extract_file_content(file_path: Path, line_range: Optional[Tuple[int, int]] = None) -> str:
+    """
+    Extract content from source file based on line range.
+
+    Args:
+        file_path: Path to the source file
+        line_range: Optional tuple (start_line, end_line) - 1-based inclusive
+
+    Returns:
+        Extracted content as string
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        # Handle different line range cases
+        if line_range is None:
+            # No line range specified - return entire file
+            return ''.join(lines)
+
+        start_line, end_line = line_range
+
+        # Convert to 0-based indexing for list access
+        start_idx = start_line - 1 if start_line is not None else 0
+        end_idx = end_line if end_line is not None else len(lines)
+
+        # Ensure indices are within bounds
+        start_idx = max(0, min(start_idx, len(lines)))
+        end_idx = max(0, min(end_idx, len(lines)))
+
+        # Extract the specified lines
+        extracted_lines = lines[start_idx:end_idx]
+        return ''.join(extracted_lines)
+
+    except FileNotFoundError:
+        return f"<!-- ERROR: File not found: {file_path} -->"
+    except Exception as e:
+        return f"<!-- ERROR: Could not read file {file_path}: {str(e)} -->"
+
+
+def parse_parameters(params_str: str) -> dict:
+    """
+    Parse parameters from quote_begin tag.
+
+    Args:
+        params_str: String containing parameters in key="value" format
+
+    Returns:
+        Dictionary of parsed parameters
+    """
+    params = {}
+    params_pattern = re.compile(r'(\w+)="([^"]*)"')
+    matches = params_pattern.findall(params_str)
+    for key, value in matches:
+        params[key] = value
+    return params
+
+
+def pre_process_quote_block(block: Dict[str, Any], md_file_path: Path, content: str, dependency_map:Dict[str, Any]):
+    """
+    Pre-Process a single quote block.
+
+    Args:
+        md_file_path: Markdown file path
+        block: Quote block dictionary
+        content: Original content (for extracting existing content)
+        dependency_map: dependency map
+
+    Returns:
+        Replacement string for the quote block
+    """
+    params_str = block['params_str']
+    original_content = content[block['content_start']:block['content_end']]
+
+    try:
+        # Parse parameters
+        params = parse_parameters(params_str)
+
+        # Extract content parameter details
+        if 'content' not in params:
+            return f"<!-- ERROR: Missing 'content' parameter -->{original_content}<!-- quote_end -->"
+
+        _, file_path, _ = parse_content_parameter(params['content'])
+        dir_path = md_file_path.parent
+        full_file_path = to_full_path(file_path, dir_path)
+        depend_file_normalized = normalized_path(full_file_path)
+        # Get normalized path of current file
+        this_file_normalized = normalized_path(md_file_path)
+        # Add dependency relationship: depend_file -> this_file
+        # Meaning: depend_file must be processed before this_file
+        if depend_file_normalized not in dependency_map:
+            dependency_map[depend_file_normalized] = {this_file_normalized}
+        else:
+            dependency_map[depend_file_normalized].add(this_file_normalized)
+    except Exception as e:
+        return f"<!-- ERROR: when pre processing {str(e)} -->{original_content}<!-- quote_end -->"
+
+
+def process_quote_block(block: Dict[str, Any], base_dir: Path) -> str:
+    """
+        Process a single quote block. Keep the quote tags, only replace the content between them.
+
+        Args:
+            block: Quote block dictionary
+            base_dir: Base directory for resolving relative file paths
+
+        Returns:
+            Replacement string that keeps the original tags but replaces the content
+    """
+    params_str = block['params_str']
+
+    try:
+        # Parse parameters
+        params = parse_parameters(params_str)
+
+        # Extract content parameter details
+        if 'content' not in params:
+            # Keep the original structure but mark error
+            begin_tag = block['begin_match'].group(0)
+            end_tag = block['end_match'].group(0)
+            return f"{begin_tag}<!-- ERROR: Missing 'content' parameter -->{end_tag}"
+
+        description, file_path, line_range = parse_content_parameter(params['content'])
+
+        # Resolve file path relative to base directory
+        full_file_path = base_dir / file_path
+
+        # Extract content from source file
+        extracted_content = extract_file_content(full_file_path, line_range)
+
+        # Get language for code block if specified
+        lang = params.get('lang', '')
+
+        # Remove trailing newlines to avoid extra blank lines
+        extracted_content = extracted_content.rstrip('\n')
+
+        # Format the extracted content
+        if lang:
+            formatted_content = f"```{lang}\n{extracted_content}\n```"
+        else:
+            formatted_content = extracted_content
+
+        # Keep the original quote tags, only replace the content between them
+        begin_tag = block['begin_match'].group(0)
+        end_tag = block['end_match'].group(0)
+        return f"{begin_tag}\n{formatted_content}\n{end_tag}"
+
+    except Exception as e:
+        # Keep the original structure but include error message
+        begin_tag = block['begin_match'].group(0)
+        end_tag = block['end_match'].group(0)
+        return f"{begin_tag}<!-- ERROR: {str(e)} -->{end_tag}"
+
+
+def find_markdown_files(directory: Path) -> List[Path]:
+    """
+    Find all Markdown files in directory and subdirectories.
+
+    Args:
+        directory: Root directory to search
+
+    Returns:
+        List of paths to Markdown files
+    """
+    markdown_files = []
+    for pattern in ['*.md', '*.markdown']:
+        markdown_files.extend(directory.rglob(pattern))
+    return markdown_files
 
 def topological_sort(dependencies):
     """
@@ -88,78 +510,6 @@ def topological_sort(dependencies):
     return result
 
 
-def extract_line_range(file_path, start_line, end_line):
-    """
-    Extract content from specified line range in a file.
-
-    Args:
-        file_path: Path to the file to read
-        start_line: Starting line number (1-based)
-        end_line: Ending line number (1-based)
-
-    Returns:
-        str: Content from the specified line range, or None if error occurs
-    """
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-
-        # Ensure line numbers are within valid range
-        start_line = max(1, min(start_line, len(lines)))
-        end_line = max(start_line, min(end_line, len(lines)))
-
-        # Extract specified line range (convert to 0-based indexing)
-        content_lines = lines[start_line - 1:end_line]
-        return ''.join(content_lines)
-    except Exception as e:
-        print(f"Error reading file {file_path}: {e}")
-        return None
-
-
-def parse_path_spec(path_spec):
-    """
-    Parse path specification to extract file path and line range.
-
-    Format example: "../../xxx.rs#L22-L34"
-
-    Args:
-        path_spec: Path specification string
-
-    Returns:
-        tuple: (file_path, start_line, end_line) or (None, None, None) if parsing fails
-    """
-    # Use regex to match path and line numbers
-    match = re.match(r'(.+)#L(\d+)-L(\d+)', path_spec)
-    if not match:
-        return None, None, None
-
-    file_path = match.group(1)
-    start_line = int(match.group(2))
-    end_line = int(match.group(3))
-
-    return file_path, start_line, end_line
-
-
-def process_parameters(match):
-    """
-    Extract parameter information from regex match.
-
-    Args:
-        match: Regex match object from quote pattern
-
-    Returns:
-        tuple: (file_path, start_line, end_line, language)
-    """
-    # Extract path information from content group
-    content_block = match.group("content")
-    file_path, start_line, end_line = parse_path_spec(content_block)
-
-    # Extract language or default to "text"
-    lang = match.group("lang")
-    lang = lang if lang else "text"
-
-    return file_path, start_line, end_line, lang
-
 
 def to_full_path(file_path, md_file_dir):
     """
@@ -177,49 +527,6 @@ def to_full_path(file_path, md_file_dir):
     else:
         return os.path.join(md_file_dir, file_path)
 
-
-def process_quote_block(match, md_file_dir):
-    """
-    Process a single quote block and replace its content with referenced file content.
-
-    Args:
-        match: Regex match object for the quote block
-        md_file_dir: Directory of the markdown file being processed
-
-    Returns:
-        str: New block content with referenced file content, or None if processing fails
-    """
-    quote_begin_block = match.group("begin_block")
-    quote_end_block = match.group("end_block")
-
-    # Extract path information from the match
-    file_path, start_line, end_line, lang = process_parameters(match)
-
-    if not file_path:
-        return None
-
-    # Convert to absolute path
-    full_file_path = to_full_path(file_path, md_file_dir)
-
-    # Read content from specified file and line range
-    text_content = extract_line_range(full_file_path, start_line, end_line)
-    if text_content is None:
-        return None
-
-    # Format the content based on language
-    if lang != "text":
-        # For source code, create a code block with language specification
-        new_code_block = f"```{lang}\n{text_content}```"
-    else:
-        # For non-code content, output directly
-        new_code_block = f"\n{text_content}"
-
-    # Rebuild the block with new content
-    new_block = f'{quote_begin_block}\n{new_code_block}\n{quote_end_block}'
-
-    return new_block
-
-
 def normalized_path(file_path):
     """
     Normalize file path to absolute and standardized format.
@@ -232,77 +539,6 @@ def normalized_path(file_path):
     """
     abs_path = os.path.abspath(file_path)
     return os.path.normpath(abs_path)
-
-
-def pre_process_md_file(md_file_path, dependency_map):
-    """
-    Pre-process a markdown file to build dependency relationships.
-
-    This function scans for quote blocks and records which files depend on which other files.
-
-    Args:
-        md_file_path: Path to the markdown file to pre-process
-        dependency_map: Dictionary to update with dependency information
-    """
-    try:
-        with open(md_file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        md_file_dir = os.path.dirname(md_file_path)
-
-        # Find all quote blocks in the file
-        match_list = re.finditer(QUOTE_PATTERN, content, flags=re.DOTALL)
-
-        # Get normalized path of current file
-        this_file_normalized = normalized_path(md_file_path)
-
-        # Process each quote block to extract dependencies
-        for match in match_list:
-            file_path, _start_line, _end_line, _ = process_parameters(match)
-            full_file_path = to_full_path(file_path, md_file_dir)
-            depend_file_normalized = normalized_path(full_file_path)
-
-            # Add dependency relationship: depend_file -> this_file
-            # Meaning: depend_file must be processed before this_file
-            if depend_file_normalized not in dependency_map:
-                dependency_map[depend_file_normalized] = {this_file_normalized}
-            else:
-                dependency_map[depend_file_normalized].add(this_file_normalized)
-
-    except Exception as e:
-        print(f"Error pre-processing file {md_file_path}: {e}")
-
-
-def process_md_file(md_file_path):
-    """
-    Process a single markdown file, replacing quote blocks with actual content.
-
-    Args:
-        md_file_path: Path to the markdown file to process
-    """
-    try:
-        with open(md_file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        md_file_dir = os.path.dirname(md_file_path)
-
-        # Replace all quote blocks with actual content
-        new_content = re.sub(
-            QUOTE_PATTERN,
-            lambda match: process_quote_block(match, md_file_dir),
-            content,
-            flags=re.DOTALL
-        )
-
-        # Write back to file only if content changed
-        if new_content != content:
-            with open(md_file_path, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            print(f"Updated quotes in: {md_file_path}")
-
-    except Exception as e:
-        print(f"Error processing file {md_file_path}: {e}")
-
 
 def is_md_file(filename):
     """
@@ -339,32 +575,13 @@ def main():
 
     if not os.path.exists(folder_path):
         print(f"Error: Folder '{folder_path}' does not exist")
-        return
+        return -1
 
-    # Find all .md files recursively
-    md_files = glob.glob(os.path.join(folder_path, "**/*.md"), recursive=True)
+    processor = MarkdownQuoteProcessor()
+    processed_count, modified_count = processor.process_directory(Path(folder_path).resolve())
 
-    if not md_files:
-        print("No markdown files found")
-        return
-
-    n = len(md_files)
-    print(f"Found {n} markdown files")
-
-    # First pass: Build dependency map
-    dep_map = {}
-    for md_file in md_files:
-        pre_process_md_file(md_file, dep_map)
-
-    # Sort files based on dependencies (files with no dependencies first)
-    sorted_files = topological_sort(dep_map)
-
-    # Second pass: Process files in dependency order
-    for file_path in sorted_files:
-        if is_md_file(file_path):
-            process_md_file(file_path)
-
-    print("Quote processing completed")
+    print(f"Processed {processed_count} files, modified {modified_count} files")
+    return 0
 
 
 if __name__ == "__main__":
