@@ -150,18 +150,33 @@ class MarkdownQuoteProcessor:
         if not blocks:
             return content
 
-        # Process blocks from innermost to outermost to handle nesting
-        # Sort by start position in reverse order so we replace from the end
-        blocks.sort(key=lambda x: x['start_pos'], reverse=True)
-
-        result = content
+        range_blocks = []
         for block in blocks:
+            range_blocks.append((block['start_pos'], block['end_pos'], block))
+
+        # Process only outer blocks
+        outer_blocks = filter_outer_ranges(range_blocks)
+
+        # Sort by start position so we replace from the start
+        outer_blocks.sort(key=lambda x: x[0])
+
+        result = ""
+        for i, (start_pos, end_pos, block) in enumerate(outer_blocks):
+            # Replace the entire block (from begin tag to end tag)
             replacement = process_quote_block(block, base_dir)
 
-            # Replace the entire block (from begin tag to end tag)
-            before = result[:block['start_pos']]
-            after = result[block['end_pos']:]
-            result = before + replacement + after
+            if i == 0:
+                before = content[:start_pos]
+                result += before
+            else:
+                prev_end_pos = outer_blocks[i - 1][1]
+                before = content[prev_end_pos:start_pos]
+                result += before
+            result += replacement
+            if i == len(outer_blocks) - 1:
+                after = content[end_pos:]
+                result += after
+
 
         return result
 
@@ -241,6 +256,38 @@ class MarkdownQuoteProcessor:
                 processed_count += 1
 
         return processed_count, modified_count
+
+
+def filter_outer_ranges(ranges):
+    """
+    Find ranges that are not contained within any other range.
+
+    Args:
+        ranges: List of tuples/lists representing ranges [m, n] where m <= n
+
+    Returns:
+        List of ranges that are not contained within any other range
+    """
+    if not ranges:
+        return []
+
+    # Sort ranges by start value, then by end value (descending)
+    # This ensures larger ranges come first when start values are equal
+    sorted_ranges = sorted(ranges, key=lambda x: (x[0], -x[1]))
+
+    result = []
+    max_end = float('-inf')
+
+    for current_range in sorted_ranges:
+        start, end, _ = current_range
+
+        # If current range's end is greater than max_end seen so far,
+        # it means this range is not contained within any previous range
+        if end > max_end:
+            result.append(current_range)
+            max_end = end
+
+    return result
 
 def indent_text(multiline_text:str) -> str:
     text = ""
